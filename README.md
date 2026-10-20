@@ -1,4 +1,4 @@
-# 🎛️ WASAPI Low-Latency Audio Router & DSP Telemetry in GO
+# GO WASAPI Low-Latency Audio Router & DSP Telemetry
 
 [![Go Version](https://img.shields.io/badge/Go-1.21%2B-blue.svg)](https://golang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)](https://www.microsoft.com/windows)
@@ -42,3 +42,61 @@ A blazing-fast, heap-safe **Windows WASAPI loopback audio router and real-time D
    ```bash
    git clone [https://github.com/masfana/wasapi-router-go.git](https://github.com/masfana/wasapi-router-go.git)
    cd wasapi-router-go
+    ```
+
+2. **Download dependencies:**
+    ```bash
+    go mod tidy
+    ```
+
+
+3. **Run the application:**
+*(Note: The build tag `//go:build windows` ensures it compiles strictly for Windows audio subsystems).*
+    ```bash
+    go run main.go
+    ```
+
+
+
+---
+
+## 🕹️ Keyboard Shortcuts
+
+| Key | Action |
+| --- | --- |
+| **`↑` / `↓**` | Navigate through the audio endpoint matrix |
+| **`Enter` / `s**` | Set the currently highlighted endpoint as the active loopback capture source |
+| **`Space`** | Toggle target render stream mirroring for the selected endpoint |
+| **`←` / `→**` | Adjust target volume (-5% / +5%) |
+| **`m`** | Mute/Unmute the selected target render stream |
+| **`[ / ]`** | Decrease / Increase Master Loopback Gain |
+| **`M`** | Toggle Master Mute |
+| **`r`** | Re-enumerate active Windows WASAPI render endpoints |
+| **`q` / `Ctrl+C**` | Quit the application |
+
+---
+
+## 📐 Architecture Overview
+
+```text
+ ┌──────────────────────┐     Raw PCM Bytes     ┌────────────────────────┐
+ │ Windows Audio Engine │ ───────────────────►  │  decodeToStereoFloat   │
+ └──────────────────────┘                       └───────────┬────────────┘
+                                                            │ Stereo Float32
+                                                            ▼
+ ┌──────────────────────┐                       ┌────────────────────────┐
+ │Target Audio Endpoints│ ◄──────────────────── │   SpscRingBuffer       │
+ └──────────────────────┘   encodeFromStereo    └───────────┬────────────┘
+                                                            │ Telemetry Feed
+                                                            ▼
+                                                ┌────────────────────────┐
+                                                │ BubbleTea TUI / DSP    │
+                                                └────────────────────────┘
+
+```
+
+---
+
+## 🛡️ License
+
+Distributed under the MIT License. See `LICENSE` for more information.
