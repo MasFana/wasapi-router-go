@@ -1003,6 +1003,12 @@ func (m *model) adjustSelectedVolume(delta float32) {
 }
 
 func (m model) View() string {
+	// Fallback terminal width if not yet received from WindowSizeMsg
+	termWidth := m.width
+	if termWidth <= 0 {
+		termWidth = 120
+	}
+
 	m.engine.telemetryMu.Lock()
 	tel := m.engine.Telemetry
 	m.engine.telemetryMu.Unlock()
@@ -1027,9 +1033,39 @@ func (m model) View() string {
 		}(),
 	)
 
+	// Dynamically calculate column widths based on terminal size
+	availableWidth := termWidth - 6
+	if availableWidth < 60 {
+		availableWidth = 60
+	}
+
+	leftWidth := int(float64(availableWidth) * 0.58)
+	rightWidth := availableWidth - leftWidth - 3
+	if leftWidth < 52 {
+		leftWidth = 52
+	}
+	if rightWidth < 38 {
+		rightWidth = 38
+	}
+
+	// Inner width of the left pane (accounting for border and horizontal padding of 1 on each side)
+	innerLeftWidth := leftWidth - 4
+	if innerLeftWidth < 40 {
+		innerLeftWidth = 40
+	}
+
+	// Fixed structural overhead:
+	// cursor (2) + space (1) + srcBadge (8) + space (1) + tgtBadge (8) + space (1) = 21 chars
+	// right side elements: space (1) + volBar (10) + space (1) + percentage (4) + right padding (2) = 18 chars
+	// Total fixed overhead = 39 chars. The remainder goes entirely to the device name.
+	nameWidth := innerLeftWidth - 39
+	if nameWidth < 12 {
+		nameWidth = 12
+	}
+
 	var devRows []string
 	devRows = append(devRows, cyanText.Render("ENDPOINT MATRIX (Source Loopback -> Multi-Target SPSC Render)"))
-	devRows = append(devRows, subTextStyle.Render(strings.Repeat("─", 68)))
+	devRows = append(devRows, subTextStyle.Render(strings.Repeat("─", innerLeftWidth)))
 
 	for i, d := range devices {
 		cursorPrefix := "  "
@@ -1037,7 +1073,8 @@ func (m model) View() string {
 			cursorPrefix = "▸ "
 		}
 
-		srcBadge := "      "
+		// Fixed-width badge columns (8 characters wide)
+		srcBadge := "        "
 		if i == srcIdx {
 			srcBadge = badgeActive.Render("SOURCE")
 		}
@@ -1064,14 +1101,18 @@ func (m model) View() string {
 				fillMs, t.SampleRate, t.Bits, t.BufferMs, ur, or)
 		}
 
-		volBar := renderMiniSlider(t.Volume, 12)
-		nameStr := truncateString(d.Name, 28)
+		volBar := renderMiniSlider(t.Volume, 10)
+
+		// Trim the device name and pad it to fill the exact flexible column width
+		rawName := truncateString(d.Name, nameWidth)
+		paddedName := fmt.Sprintf("%-*s", nameWidth, rawName)
 		if i == m.cursor {
-			nameStr = cyanText.Render(nameStr)
+			paddedName = cyanText.Render(paddedName)
 		}
 
-		row := fmt.Sprintf("%s%-6s %-8s %-28s %s %3.0f%%",
-			cursorPrefix, srcBadge, tgtBadge, nameStr, volBar, t.Volume*100)
+		// Row format: Cursor -> Source Badge -> Target Badge -> Flexible Device Name -> Right-aligned Volume Controls + Padding
+		row := fmt.Sprintf("%s%s %s %s %s %3.0f%%  ",
+			cursorPrefix, srcBadge, tgtBadge, paddedName, volBar, t.Volume*100)
 		devRows = append(devRows, row)
 		if ringInfo != "" {
 			devRows = append(devRows, warnText.Render(ringInfo))
@@ -1083,15 +1124,21 @@ func (m model) View() string {
 	if m.focusPane != 1 {
 		leftPaneStyle = inactivePaneStyle
 	}
-	leftPane := leftPaneStyle.Width(72).Render(strings.Join(devRows, "\n"))
+	leftPane := leftPaneStyle.Width(leftWidth).Render(strings.Join(devRows, "\n"))
 
-	vuL := renderVUMeter("L", tel.RMSL, tel.PeakL, 28)
-	vuR := renderVUMeter("R", tel.RMSR, tel.PeakR, 28)
+	// Scale visualizer components to fit dynamically inside the right pane width
+	vuBarWidth := rightWidth - 22
+	if vuBarWidth < 12 {
+		vuBarWidth = 12
+	}
+
+	vuL := renderVUMeter("L", tel.RMSL, tel.PeakL, vuBarWidth)
+	vuR := renderVUMeter("R", tel.RMSR, tel.PeakR, vuBarWidth)
 	spec := renderSpectrum16(tel.Spectrum, 8)
 
 	rightContent := strings.Join([]string{
 		cyanText.Render("REAL-TIME PCM VISUALIZER"),
-		subTextStyle.Render(strings.Repeat("─", 40)),
+		subTextStyle.Render(strings.Repeat("─", rightWidth-4)),
 		vuL,
 		vuR,
 		"",
@@ -1099,7 +1146,7 @@ func (m model) View() string {
 		spec,
 	}, "\n")
 
-	rightPane := bgStyle.Width(44).Render(rightContent)
+	rightPane := bgStyle.Width(rightWidth).Render(rightContent)
 	mainBody := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, " ", rightPane)
 
 	helpBar := subTextStyle.Render(
@@ -1117,7 +1164,6 @@ func (m model) View() string {
 		helpBar,
 	)
 }
-
 func renderMiniSlider(val float32, width int) string {
 	norm := float64(val) / 1.5
 	if norm > 1.0 {
