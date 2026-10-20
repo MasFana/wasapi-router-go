@@ -1,4 +1,4 @@
-module wasapi-tui-mirror
+module wasapi-router-go
 
 go 1.27.2
 
