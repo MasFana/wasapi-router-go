@@ -23,25 +23,7 @@ Unlike standard audio routers that suffer from Go garbage-collection stutters, c
 
 ## 🖥️ Terminal UI Preview
 
-```text
-⚡ WASAPI RT-MATRIX   MMCSS: PRO AUDIO   SRC 48000Hz/32bit • 3.0ms   DRIFT TARGET: 10ms   SRC VOL 100% ( +0.0dB)
-╭─ ROUTING MATRIX (4 endpoints) ───────────────────────────╮ ╭─ MASTER DSP TELEMETRY & LOGARITHMIC dBFS METER ─────────╮
-│   ROLE  ENDPOINT                    LATENCY  OS+DSP VOL  │ │ L ████████████████████████████▒▒▒·┃····  -3.2 dBFS      │
-│ ──────────────────────────────────────────────────────── │ │ R ███████████████████████████▒▒▒▒·┃····  -3.4 dBFS      │
-│   [SRC] Speakers (Realtek Audio)      3.0ms  ━━━━━━ 100% │ │   -60       -40       -24       -12    -6    0dB        │
-│ ▸ [OUT] Headphones (JadeAudio JA11)  11.2ms  ━━━━╸─  78% │ │ PAN L──────◆─────R   PHASE -1──────┼────●─+1            │
-│   [OUT] Wireless Gaming Headset      12.5ms  ━━━━━━ 120% │ │ ─────────────────────────────────────────────────────── │
-│   [ · ] DELL S2721DGF (NVIDIA HD)      --    ━━━───  50% │ │ 16-BAND HARMONIC RTA SPECTRUM (HANN-GOERTZEL • PEAK)    │
-│                                                          │ │ ·· ·· ▔▔ ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ··         │
-│                                                          │ │ ██ ██ ██ ▆▆ ▃▃ ▔▔ ·· ·· ▔▔ ·· ·· ·· ·· ·· ·· ··         │
-│ ──────────────────────────────────────────────────────── │ │ ██ ██ ██ ██ ██ ▇▇ ▅▅ ▃▃ ██ ▆▆ ▄▄ ▂▂ ▔▔ ·· ·· ··         │
-│ INSPECT: Headphones (2- JadeAudio JA11)                  │ │ ██ ██ ██ ██ ██ ██ ██ ██ ██ ██ ██ ██ ▇▇ ▅▅ ▃▃ ▁▁         │
-│ WIN-OS:  78%  DSP: 1.00x ( -2.2dB)  FMT: 48000Hz/32bit   │ │ 45 65 95 14 20 30 44 64 93 1. 2k 2. 4. 6. 9k 13         │
-│ RING:   8.2ms   DAC:   6.0ms   U/O:    0/0               │ ╰─────────────────────────────────────────────────────────╯
-╰──────────────────────────────────────────────────────────╯
-● [Headphones (2- JadeAudio...] Windows OS Vol: 78% | DSP Boost: 1.00x
-[↑/↓] Nav  [Space] Toggle Out  [Enter/s] Set Src  [←/→] OS Vol+Boost  [m] OS Mute  [[/]] Src Vol  [-/+] Latency  [q] Quit
-```
+![](ui.png)
 
 ---
 
