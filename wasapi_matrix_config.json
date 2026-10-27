@@ -1,0 +1,35 @@
+{
+  "source_device_id": "{0.0.0.00000000}.{cbc379e5-fd8c-49df-be7c-3e8e04ccd7a6}",
+  "target_floor_ms": 4,
+  "auto_sync_mode": false,
+  "endpoints": {
+    "{0.0.0.00000000}.{01240311-31c1-40d5-b097-52373a3ee7d1}": {
+      "name": "Headphones (JadeAudio JA11)",
+      "active": true,
+      "volume": 0.30066085,
+      "muted": false,
+      "extra_offset_ms": 240
+    },
+    "{0.0.0.00000000}.{2dad0681-7820-4dc4-8ab1-84f5012c6803}": {
+      "name": "Speakers (Senary Audio)",
+      "active": true,
+      "volume": 0.29999998,
+      "muted": false,
+      "extra_offset_ms": 240
+    },
+    "{0.0.0.00000000}.{8453c36c-5ec1-49f5-b8df-af29cae2354b}": {
+      "name": "Headphones (JZ-330)",
+      "active": true,
+      "volume": 0.5023682,
+      "muted": false,
+      "extra_offset_ms": 0
+    },
+    "{0.0.0.00000000}.{cbc379e5-fd8c-49df-be7c-3e8e04ccd7a6}": {
+      "name": "CABLE Input (VB-Audio Virtual Cable)",
+      "active": false,
+      "volume": 0.30000007,
+      "muted": false,
+      "extra_offset_ms": 0
+    }
+  }
+}

@@ -4,9 +4,11 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -25,6 +27,7 @@ import (
 const (
 	AUDCLNT_STREAMFLAGS_LOWLATENCY = 0x08000000
 	THREAD_PRIORITY_TIME_CRITICAL  = 15
+	configFileName                 = "wasapi_matrix_config.json"
 )
 
 var (
@@ -37,7 +40,37 @@ var (
 )
 
 // ============================================================================
-// 1. LOCK-FREE SPSC RING BUFFER WITH TRUE SRC, DRIFT LOCK & DE-ZIPPERING
+// 0. PERSISTENT JSON CONFIGURATION SCHEMA
+// ============================================================================
+
+type EndpointSetting struct {
+	Name          string  `json:"name"`
+	Active        bool    `json:"active"`
+	Volume        float32 `json:"volume"`
+	Muted         bool    `json:"muted"`
+	ExtraOffsetMs int32   `json:"extra_offset_ms"`
+}
+
+type PersistentConfig struct {
+	SourceDeviceID string                     `json:"source_device_id"`
+	TargetFloorMs  uint32                     `json:"target_floor_ms"`
+	AutoSyncMode   bool                       `json:"auto_sync_mode"`
+	Endpoints      map[string]EndpointSetting `json:"endpoints"`
+}
+
+func resolveConfigPath() string {
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		// If running via `go run` in Temp, save in working directory instead
+		if !strings.Contains(strings.ToLower(dir), "temp") && !strings.Contains(strings.ToLower(dir), "go-build") {
+			return filepath.Join(dir, configFileName)
+		}
+	}
+	return configFileName
+}
+
+// ============================================================================
+// 1. LOCK-FREE SPSC RING BUFFER WITH 4-POINT HERMITE CUBIC SRC & DE-ZIPPERING
 // ============================================================================
 
 type SpscRingBuffer struct {
@@ -108,8 +141,8 @@ func (r *SpscRingBuffer) WriteStereo(src []float32, frames uint64) uint64 {
 	return frames
 }
 
-// ReadStereoAdaptive performs click-free Fractional Resampling across mismatched sample rates
-// (e.g., 48kHz -> 44.1kHz or 16kHz Bluetooth) AND locks buffer fill to targetLatencyFrames.
+// ReadStereoAdaptive performs 4-point Hermite cubic fractional resampling across
+// mismatched sample rates (e.g., 48kHz -> 44.1kHz) AND locks buffer fill to targetLatencyFrames.
 func (r *SpscRingBuffer) ReadStereoAdaptive(
 	dst []float32,
 	outFrames uint64,
@@ -120,7 +153,7 @@ func (r *SpscRingBuffer) ReadStereoAdaptive(
 	targetLatencyFrames uint64,
 ) uint64 {
 	avail := r.AvailableRead()
-	if avail < 4 || outFrames == 0 {
+	if avail < 6 || outFrames == 0 {
 		if outFrames > 0 {
 			atomic.AddUint64(&r.underrun, 1)
 			clear(dst[:outFrames*2])
@@ -156,15 +189,15 @@ func (r *SpscRingBuffer) ReadStereoAdaptive(
 	driftAdjust := clampFloat64(driftError*0.00002, -0.025, 0.025)
 	stepRatio := baseRatio * (1.0 + driftAdjust)
 
-	maxNeeded := uint64(math.Ceil(float64(outFrames)*stepRatio)) + 2
+	maxNeeded := uint64(math.Ceil(float64(outFrames)*stepRatio)) + 3
 	if maxNeeded > avail {
-		// If we are intentionally building up delay for cross-device sync, output silence
+		// If intentionally building up delay for cross-device sync, output silence
 		// while letting the ring buffer accumulate up to targetLatencyFrames.
 		if avail < targetLatencyFrames/2 {
 			clear(dst[:outFrames*2])
 			return 0
 		}
-		stepRatio = float64(avail-2) / float64(outFrames)
+		stepRatio = float64(avail-3) / float64(outFrames)
 		if stepRatio < baseRatio*0.92 {
 			atomic.AddUint64(&r.underrun, 1)
 			clear(dst[:outFrames*2])
@@ -184,11 +217,14 @@ func (r *SpscRingBuffer) ReadStereoAdaptive(
 		intOffset := uint64(pos)
 		frac := float32(pos - float64(intOffset))
 
-		idx0 := ((rd + intOffset) % cap) * 2
-		idx1 := ((rd + intOffset + 1) % cap) * 2
+		// 4-Point Hermite Cubic Interpolation (preserves high-frequency response up to 20kHz)
+		idx0 := ((rd + intOffset + cap - 1) % cap) * 2
+		idx1 := ((rd + intOffset) % cap) * 2
+		idx2 := ((rd + intOffset + 1) % cap) * 2
+		idx3 := ((rd + intOffset + 2) % cap) * 2
 
-		sL := r.buf[idx0] + frac*(r.buf[idx1]-r.buf[idx0])
-		sR := r.buf[idx0+1] + frac*(r.buf[idx1+1]-r.buf[idx0+1])
+		sL := hermite4(frac, r.buf[idx0], r.buf[idx1], r.buf[idx2], r.buf[idx3])
+		sR := hermite4(frac, r.buf[idx0+1], r.buf[idx1+1], r.buf[idx2+1], r.buf[idx3+1])
 
 		dstIdx := i * 2
 		dst[dstIdx] = softLimit(sL * curGain)
@@ -205,9 +241,15 @@ func (r *SpscRingBuffer) ReadStereoAdaptive(
 	return outFrames
 }
 
-// splitHybridVolume separates a [0.0 .. 1.5] UI slider into:
-// 1. OS Native Hardware Scalar [0.0 .. 1.0] (controlled via IAudioEndpointVolume)
-// 2. DSP Digital Boost Multiplier [1.0 .. 2.0] (only engages above 100% to avoid double-attenuation!)
+// hermite4 computes 4-point, 3rd-order Hermite (Catmull-Rom) cubic interpolation
+func hermite4(frac, y0, y1, y2, y3 float32) float32 {
+	c0 := y1
+	c1 := 0.5 * (y2 - y0)
+	c2 := y0 - 2.5*y1 + 2.0*y2 - 0.5*y3
+	c3 := 0.5*(y3-y0) + 1.5*(y1-y2)
+	return ((c3*frac+c2)*frac+c1)*frac + c0
+}
+
 func splitHybridVolume(slider float32) (osScalar float32, dspBoost float32) {
 	if slider <= 0.001 {
 		return 0.0, 0.0
@@ -229,7 +271,8 @@ func effectiveTotalGain(slider float32) float32 {
 }
 
 func softLimit(x float32) float32 {
-	if x > -0.90 && x < 0.90 {
+	// Bit-transparent pass-through up to 0.99 (-0.08 dBFS) when no DSP boost is clipping
+	if x > -0.99 && x < 0.99 {
 		return x
 	}
 	if x > 3.0 {
@@ -377,7 +420,7 @@ func encodeFromStereoFloat(srcStereo []float32, rawPtr *byte, frames int, channe
 }
 
 // ============================================================================
-// 3. LOW-LATENCY WASAPI ENGINE + CROSS-DEVICE LATENCY SYNC + OS VOLUME SYNC
+// 3. LOW-LATENCY WASAPI ENGINE + CROSS-DEVICE SYNC + JSON PERSISTENCE
 // ============================================================================
 
 func boostProAudioThread() func() {
@@ -425,7 +468,7 @@ type TargetState struct {
 	Channels      uint32 // atomic
 	Bits          uint32 // atomic
 	BufferUs      uint32 // atomic (microseconds)
-	ExtraOffsetMs int32  // atomic manual delay offset in ms (for compensating BT air-gap lag)
+	ExtraOffsetMs int32  // atomic manual delay offset in ms (persisted in JSON)
 }
 
 func (t *TargetState) IsActive() bool { return atomic.LoadUint32(&t.ActiveFlag) == 1 }
@@ -483,6 +526,10 @@ type AudioEngine struct {
 
 	volCmdChan chan endpointVolCmd
 
+	configMu    sync.Mutex
+	configPath  string
+	savedConfig PersistentConfig
+
 	telemetryMu sync.Mutex
 	Telemetry   AudioTelemetry
 }
@@ -493,12 +540,96 @@ func NewAudioEngine() *AudioEngine {
 		SourceIndex:   0,
 		TargetFloorMs: 10,
 		SrcSampleRate: 48000,
-		AutoSyncMode:  1, // Enabled by default so all active outputs match ms latency
+		AutoSyncMode:  1,
 		volCmdChan:    make(chan endpointVolCmd, 64),
+		configPath:    resolveConfigPath(),
+		savedConfig: PersistentConfig{
+			TargetFloorMs: 10,
+			AutoSyncMode:  true,
+			Endpoints:     make(map[string]EndpointSetting),
+		},
 	}
 	eng.SetMasterVolumeInternal(1.0)
+	eng.LoadConfigFromDisk()
 	go eng.osVolumeSyncWorker()
 	return eng
+}
+
+// LoadConfigFromDisk reads the saved JSON state before device enumeration
+func (e *AudioEngine) LoadConfigFromDisk() {
+	e.configMu.Lock()
+	defer e.configMu.Unlock()
+
+	data, err := os.ReadFile(e.configPath)
+	if err != nil {
+		return
+	}
+
+	var cfg PersistentConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return
+	}
+	if cfg.Endpoints == nil {
+		cfg.Endpoints = make(map[string]EndpointSetting)
+	}
+
+	if cfg.TargetFloorMs >= 4 && cfg.TargetFloorMs <= 100 {
+		atomic.StoreUint32(&e.TargetFloorMs, cfg.TargetFloorMs)
+	} else {
+		cfg.TargetFloorMs = 10
+	}
+
+	if cfg.AutoSyncMode {
+		atomic.StoreUint32(&e.AutoSyncMode, 1)
+	} else {
+		atomic.StoreUint32(&e.AutoSyncMode, 0)
+	}
+
+	e.savedConfig = cfg
+}
+
+// SaveConfigAsync snapshots current engine settings and writes them atomically to JSON
+func (e *AudioEngine) SaveConfigAsync() {
+	go func() {
+		e.configMu.Lock()
+		defer e.configMu.Unlock()
+
+		e.mu.RLock()
+		srcID := ""
+		if e.SourceIndex >= 0 && e.SourceIndex < len(e.Devices) {
+			srcID = e.Devices[e.SourceIndex].ID
+		}
+		if srcID != "" {
+			e.savedConfig.SourceDeviceID = srcID
+		}
+		e.savedConfig.TargetFloorMs = atomic.LoadUint32(&e.TargetFloorMs)
+		e.savedConfig.AutoSyncMode = atomic.LoadUint32(&e.AutoSyncMode) == 1
+
+		if e.savedConfig.Endpoints == nil {
+			e.savedConfig.Endpoints = make(map[string]EndpointSetting)
+		}
+
+		for id, t := range e.Targets {
+			e.savedConfig.Endpoints[id] = EndpointSetting{
+				Name:          t.Device.Name,
+				Active:        t.IsActive(),
+				Volume:        t.GetVolume(),
+				Muted:         t.IsMuted(),
+				ExtraOffsetMs: atomic.LoadInt32(&t.ExtraOffsetMs),
+			}
+		}
+
+		snapshot, err := json.MarshalIndent(e.savedConfig, "", "  ")
+		e.mu.RUnlock()
+		if err != nil {
+			return
+		}
+
+		tmpPath := e.configPath + ".tmp"
+		if err := os.WriteFile(tmpPath, snapshot, 0644); err == nil {
+			_ = os.Rename(tmpPath, e.configPath)
+		}
+	}()
 }
 
 // ComputeTargetRingFrames calculates how many source frames a target's ring buffer
@@ -582,6 +713,7 @@ func (e *AudioEngine) SetMasterVolume(v float32) {
 		osScalar, _ := splitHybridVolume(v)
 		e.queueOSVolumeUpdate(srcID, true, osScalar, false, false)
 	}
+	e.SaveConfigAsync()
 }
 
 func (e *AudioEngine) GetMasterVolume() float32 {
@@ -621,6 +753,7 @@ func (e *AudioEngine) ToggleMasterMute() bool {
 	if srcID != "" {
 		e.queueOSVolumeUpdate(srcID, false, 0, true, isMuted)
 	}
+	e.SaveConfigAsync()
 	return isMuted
 }
 
@@ -650,6 +783,7 @@ func (e *AudioEngine) SetDeviceVolume(deviceID string, newVol float32) {
 
 	osScalar, _ := splitHybridVolume(newVol)
 	e.queueOSVolumeUpdate(deviceID, true, osScalar, false, false)
+	e.SaveConfigAsync()
 }
 
 func (e *AudioEngine) ToggleDeviceMute(deviceID string) bool {
@@ -682,6 +816,7 @@ func (e *AudioEngine) ToggleDeviceMute(deviceID string) bool {
 	}
 
 	e.queueOSVolumeUpdate(deviceID, false, 0, true, muted)
+	e.SaveConfigAsync()
 	return muted
 }
 
@@ -904,30 +1039,78 @@ func (e *AudioEngine) RefreshDevices() error {
 			})
 		}
 
+		e.configMu.Lock()
+		savedCfg := e.savedConfig
+		e.configMu.Unlock()
+
 		e.mu.Lock()
 		devList := make([]DeviceInfo, len(list))
+
+		// Determine SourceIndex (prefer saved SourceDeviceID if present, else Windows Default)
+		chosenSrcIdx := -1
 		for idx, item := range list {
 			devList[idx] = item.info
-			if item.info.IsDefault && !e.IsCapturing {
-				e.SourceIndex = idx
+			if savedCfg.SourceDeviceID != "" && item.info.ID == savedCfg.SourceDeviceID {
+				chosenSrcIdx = idx
 			}
+		}
+		if chosenSrcIdx == -1 {
+			for idx, item := range list {
+				if item.info.IsDefault {
+					chosenSrcIdx = idx
+					break
+				}
+			}
+		}
+		if chosenSrcIdx >= 0 && !e.IsCapturing {
+			e.SourceIndex = chosenSrcIdx
+		}
+
+		var targetsToAutoStart []*TargetState
+
+		for idx, item := range list {
 			ts, exists := e.Targets[item.info.ID]
+			savedEp, hasSaved := savedCfg.Endpoints[item.info.ID]
+
 			if !exists {
 				ts = &TargetState{
 					Device: item.info,
 					Ring:   NewSpscRingBuffer(96000),
 				}
+				if hasSaved {
+					atomic.StoreInt32(&ts.ExtraOffsetMs, savedEp.ExtraOffsetMs)
+					ts.SetVolume(savedEp.Volume)
+					if savedEp.Muted {
+						atomic.StoreUint32(&ts.MutedFlag, 1)
+					}
+					osScalar, _ := splitHybridVolume(savedEp.Volume)
+					e.queueOSVolumeUpdate(item.info.ID, true, osScalar, true, savedEp.Muted)
+
+					if savedEp.Active && idx != e.SourceIndex {
+						targetsToAutoStart = append(targetsToAutoStart, ts)
+					}
+				} else {
+					ts.SetVolume(item.osVol)
+					if item.osMute {
+						atomic.StoreUint32(&ts.MutedFlag, 1)
+					}
+				}
 				e.Targets[item.info.ID] = ts
-			}
-			ts.SetVolume(item.osVol)
-			if item.osMute {
-				atomic.StoreUint32(&ts.MutedFlag, 1)
 			} else {
-				atomic.StoreUint32(&ts.MutedFlag, 0)
-			}
-			if idx == e.SourceIndex {
-				e.SetMasterVolumeInternal(item.osVol)
+				ts.Device = item.info
+				if !(ts.GetVolume() > 1.0 && item.osVol >= 0.98) {
+					ts.SetVolume(item.osVol)
+				}
 				if item.osMute {
+					atomic.StoreUint32(&ts.MutedFlag, 1)
+				} else {
+					atomic.StoreUint32(&ts.MutedFlag, 0)
+				}
+			}
+
+			if idx == e.SourceIndex {
+				e.SetMasterVolumeInternal(ts.GetVolume())
+				if ts.IsMuted() {
 					atomic.StoreUint32(&e.MasterMute, 1)
 				} else {
 					atomic.StoreUint32(&e.MasterMute, 0)
@@ -935,7 +1118,18 @@ func (e *AudioEngine) RefreshDevices() error {
 			}
 		}
 		e.Devices = devList
+
+		// Start any saved active output streams that aren't already running
+		for _, ts := range targetsToAutoStart {
+			if !ts.IsActive() {
+				ts.Ring.Reset()
+				ts.StopChan = make(chan struct{})
+				atomic.StoreUint32(&ts.ActiveFlag, 1)
+				go e.renderTargetThread(ts, ts.StopChan)
+			}
+		}
 		e.mu.Unlock()
+
 		errCh <- nil
 	}()
 	return <-errCh
@@ -955,6 +1149,13 @@ func (e *AudioEngine) RestartSourceCapture(sourceIdx int) {
 	}
 	srcDev := e.Devices[e.SourceIndex]
 	if t, ok := e.Targets[srcDev.ID]; ok {
+		// Prevent echo: if the new capture source was previously an active output, stop its render stream
+		if t.IsActive() {
+			if t.StopChan != nil {
+				close(t.StopChan)
+			}
+			atomic.StoreUint32(&t.ActiveFlag, 0)
+		}
 		e.SetMasterVolumeInternal(t.GetVolume())
 		if t.IsMuted() {
 			atomic.StoreUint32(&e.MasterMute, 1)
@@ -968,14 +1169,14 @@ func (e *AudioEngine) RestartSourceCapture(sourceIdx int) {
 	e.mu.Unlock()
 
 	go e.captureLoopbackThread(srcDev.ID, stopCh)
+	e.SaveConfigAsync()
 }
 
 func (e *AudioEngine) ToggleTarget(deviceID string) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	t, ok := e.Targets[deviceID]
 	if !ok {
+		e.mu.Unlock()
 		return
 	}
 
@@ -990,6 +1191,9 @@ func (e *AudioEngine) ToggleTarget(deviceID string) {
 		atomic.StoreUint32(&t.ActiveFlag, 1)
 		go e.renderTargetThread(t, t.StopChan)
 	}
+	e.mu.Unlock()
+
+	e.SaveConfigAsync()
 }
 
 func (e *AudioEngine) captureLoopbackThread(deviceID string, stopCh chan struct{}) {
@@ -1503,7 +1707,7 @@ func initialModel(eng *AudioEngine) model {
 	eng.RestartSourceCapture(eng.SourceIndex)
 	return model{
 		engine:    eng,
-		statusMsg: "Auto Latency Sync Active • Use [,] / [.] on wired outputs to match Bluetooth wireless delay",
+		statusMsg: fmt.Sprintf("Loaded %s • [,] / [.] Adjust Offset • [a] Toggle Sync Lock", filepath.Base(eng.configPath)),
 	}
 }
 
@@ -1531,6 +1735,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch msg.String() {
 		case "q", "ctrl+c":
+			m.engine.SaveConfigAsync()
 			return m, tea.Quit
 
 		case "up", "k":
@@ -1546,7 +1751,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "s", "enter":
 			if devCount > 0 {
 				m.engine.RestartSourceCapture(m.cursor)
-				m.statusMsg = fmt.Sprintf("Switched Loopback Capture Source -> Endpoint #%d", m.cursor+1)
+				m.statusMsg = fmt.Sprintf("Saved Capture Source -> Endpoint #%d", m.cursor+1)
 			}
 
 		case " ":
@@ -1560,7 +1765,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.statusMsg = "Echo Guard: Cannot mirror loopback directly into active capture source!"
 				} else {
 					m.engine.ToggleTarget(dev.ID)
-					m.statusMsg = fmt.Sprintf("Toggled Render Stream: %s", dev.Name)
+					m.statusMsg = fmt.Sprintf("Toggled & Saved Render Stream: %s", dev.Name)
 				}
 			}
 
@@ -1571,9 +1776,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.engine.mu.RUnlock()
 				muted := m.engine.ToggleDeviceMute(dev.ID)
 				if muted {
-					m.statusMsg = fmt.Sprintf("Muted Windows Native Endpoint: %s", dev.Name)
+					m.statusMsg = fmt.Sprintf("Muted & Saved Endpoint: %s", dev.Name)
 				} else {
-					m.statusMsg = fmt.Sprintf("Unmuted Windows Native Endpoint: %s", dev.Name)
+					m.statusMsg = fmt.Sprintf("Unmuted & Saved Endpoint: %s", dev.Name)
 				}
 			}
 
@@ -1607,24 +1812,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cur := atomic.LoadUint32(&m.engine.TargetFloorMs)
 			if cur > 4 {
 				atomic.StoreUint32(&m.engine.TargetFloorMs, cur-2)
-				m.statusMsg = fmt.Sprintf("Target Ring Buffer Floor tightened to %d ms", cur-2)
+				m.engine.SaveConfigAsync()
+				m.statusMsg = fmt.Sprintf("Target Ring Buffer Floor tightened to %d ms (Saved)", cur-2)
 			}
 
 		case "=", "+":
 			cur := atomic.LoadUint32(&m.engine.TargetFloorMs)
 			if cur < 50 {
 				atomic.StoreUint32(&m.engine.TargetFloorMs, cur+2)
-				m.statusMsg = fmt.Sprintf("Target Ring Buffer Floor relaxed to %d ms", cur+2)
+				m.engine.SaveConfigAsync()
+				m.statusMsg = fmt.Sprintf("Target Ring Buffer Floor relaxed to %d ms (Saved)", cur+2)
 			}
 
 		case "a":
 			cur := atomic.LoadUint32(&m.engine.AutoSyncMode)
 			next := cur ^ 1
 			atomic.StoreUint32(&m.engine.AutoSyncMode, next)
+			m.engine.SaveConfigAsync()
 			if next == 1 {
-				m.statusMsg = "AUTO LATENCY SYNC: ON (All outputs locked to slowest active endpoint)"
+				m.statusMsg = "AUTO LATENCY SYNC: ON (Saved • All outputs locked to slowest endpoint)"
 			} else {
-				m.statusMsg = "AUTO LATENCY SYNC: OFF (Independent minimum latency per endpoint)"
+				m.statusMsg = "AUTO LATENCY SYNC: OFF (Saved • Independent latency per endpoint)"
 			}
 
 		case ",":
@@ -1639,7 +1847,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						atomic.StoreInt32(&t.ExtraOffsetMs, 0)
 						newOff = 0
 					}
-					m.statusMsg = fmt.Sprintf("[%s] Manual Sync Delay Offset: +%dms", truncateString(dev.Name, 24), newOff)
+					m.engine.SaveConfigAsync()
+					m.statusMsg = fmt.Sprintf("[%s] Saved Delay Offset: +%dms", truncateString(dev.Name, 24), newOff)
 				}
 			}
 
@@ -1655,7 +1864,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						atomic.StoreInt32(&t.ExtraOffsetMs, 1000)
 						newOff = 1000
 					}
-					m.statusMsg = fmt.Sprintf("[%s] Manual Sync Delay Offset: +%dms", truncateString(dev.Name, 24), newOff)
+					m.engine.SaveConfigAsync()
+					m.statusMsg = fmt.Sprintf("[%s] Saved Delay Offset: +%dms", truncateString(dev.Name, 24), newOff)
 				}
 			}
 
@@ -1683,14 +1893,14 @@ func (m *model) adjustSelectedVolume(delta float32) {
 		m.engine.SetDeviceVolume(dev.ID, newVol)
 		actual := t.GetVolume()
 		osScalar, dspBoost := splitHybridVolume(actual)
-		m.statusMsg = fmt.Sprintf("[%s] Windows OS Vol: %.0f%% | DSP Boost: %.2fx", truncateString(dev.Name, 24), osScalar*100, dspBoost)
+		m.statusMsg = fmt.Sprintf("[%s] Saved Vol: %.0f%% | DSP Boost: %.2fx", truncateString(dev.Name, 24), osScalar*100, dspBoost)
 	}
 }
 
 func (m model) View() string {
 	termWidth := m.width
 	if termWidth <= 0 {
-		termWidth = 122
+		termWidth = 126
 	}
 
 	m.engine.telemetryMu.Lock()
@@ -1732,23 +1942,31 @@ func (m model) View() string {
 	)
 
 	availW := termWidth - 4
-	if availW < 84 {
-		availW = 84
+	if availW < 92 {
+		availW = 92
 	}
-	leftW := int(float64(availW) * 0.48)
-	if leftW < 48 {
-		leftW = 48
+	leftW := int(float64(availW) * 0.52)
+	if leftW < 54 {
+		leftW = 54
 	}
-	if leftW > 66 {
-		leftW = 66
+	if leftW > 74 {
+		leftW = 74
 	}
 	rightW := availW - leftW - 1
 	innerLeftW := leftW - 4
 	innerRightW := rightW - 4
 
+	// Table column layout:
+	// cur(2) + role(5) + sp(1) + name(nameColW) + sp(1) + lat(7) + sp(1) + off(6) + sp(1) + vol(11) = innerLeftW
+	// Fixed non-name width = 35 chars
+	nameColW := innerLeftW - 35
+	if nameColW < 10 {
+		nameColW = 10
+	}
+
 	var leftLines []string
-	colHdr := fmt.Sprintf("  %-5s %-*s %-8s %-11s", "ROLE", innerLeftW-29, "ENDPOINT", "LATENCY", "OS+DSP VOL")
-	leftLines = append(leftLines, cyanText.Render("ROUTING MATRIX")+" "+dimText.Render(fmt.Sprintf("(%d endpoints)", len(devices))))
+	colHdr := fmt.Sprintf("  %-5s %-*s %-7s %-6s %-11s", "ROLE", nameColW, "ENDPOINT", "LATENCY", "OFFSET", "OS+DSP VOL")
+	leftLines = append(leftLines, cyanText.Render("ROUTING MATRIX")+" "+dimText.Render(fmt.Sprintf("(%d endpoints • JSON Persisted)", len(devices))))
 	leftLines = append(leftLines, dimText.Render(colHdr))
 	leftLines = append(leftLines, dimText.Render(strings.Repeat("─", innerLeftW)))
 
@@ -1760,11 +1978,6 @@ func (m model) View() string {
 	endIdx := startIdx + maxVisibleRows
 	if endIdx > len(devices) {
 		endIdx = len(devices)
-	}
-
-	nameColW := innerLeftW - 29
-	if nameColW < 12 {
-		nameColW = 12
 	}
 
 	var selectedTarget *TargetState
@@ -1807,18 +2020,31 @@ func (m model) View() string {
 			paddedName = dimText.Render(paddedName)
 		}
 
-		latStr := dimText.Render("   --   ")
+		// LATENCY column (7 chars wide)
+		latStr := dimText.Render("  --   ")
 		if i == srcIdx {
-			latStr = cyanText.Render(fmt.Sprintf("%5.1fms ", tel.PeriodMs))
+			latStr = cyanText.Render(fmt.Sprintf("%5.1fms", tel.PeriodMs))
 		} else if t != nil && t.IsActive() {
-			// Ring buffer stores frames at SrcSampleRate
 			ringMs := float64(t.Ring.AvailableRead()) * 1000.0 / float64(srcSr)
 			hwMs := float64(atomic.LoadUint32(&t.BufferUs)) / 1000.0
 			totalMs := ringMs + hwMs*0.5
 			if totalMs < 25.0 {
-				latStr = greenText.Render(fmt.Sprintf("%5.1fms ", totalMs))
+				latStr = greenText.Render(fmt.Sprintf("%5.1fms", totalMs))
 			} else {
-				latStr = amberText.Render(fmt.Sprintf("%5.1fms ", totalMs))
+				latStr = amberText.Render(fmt.Sprintf("%5.1fms", totalMs))
+			}
+		}
+
+		// OFFSET column (6 chars wide)
+		offStr := dimText.Render("  0ms ")
+		if i == srcIdx {
+			offStr = dimText.Render("  --  ")
+		} else if t != nil {
+			offMs := atomic.LoadInt32(&t.ExtraOffsetMs)
+			if offMs > 0 {
+				offStr = amberText.Render(fmt.Sprintf("+%-3dms", offMs))
+			} else if t.IsActive() {
+				offStr = mutedText.Render(" +0ms ")
 			}
 		}
 
@@ -1830,7 +2056,7 @@ func (m model) View() string {
 		}
 		volStr := renderCompactGain(vol, muted, 6)
 
-		rowLine := fmt.Sprintf("%s%s %s %s %s", curGlyph, roleTag, paddedName, latStr, volStr)
+		rowLine := fmt.Sprintf("%s%s %s %s %s %s", curGlyph, roleTag, paddedName, latStr, offStr, volStr)
 		if i == m.cursor {
 			rowLine = rowSelectedBg.Render(rowLine)
 		}
@@ -1924,7 +2150,7 @@ func (m model) View() string {
 
 	statusBar := greenText.Render("● ") + mutedText.Render(m.statusMsg)
 	helpBar := dimText.Render(
-		"[↑/↓] Nav  [Space] Out  [Enter] Src  [←/→] Vol  [,/.] +Delay  [a] Auto-Sync  [-/+] Floor  [q] Quit",
+		"[↑/↓] Nav  [Space] Out  [Enter] Src  [←/→] Vol  [,/.] +Offset  [a] Sync Lock  [-/+] Floor  [q] Quit",
 	)
 
 	return lipgloss.JoinVertical(
