@@ -37,7 +37,7 @@ var (
 )
 
 // ============================================================================
-// 1. LOCK-FREE SPSC RING BUFFER WITH FRACTIONAL DRIFT RESAMPLER & DE-ZIPPERING
+// 1. LOCK-FREE SPSC RING BUFFER WITH TRUE SRC, DRIFT LOCK & DE-ZIPPERING
 // ============================================================================
 
 type SpscRingBuffer struct {
@@ -79,8 +79,8 @@ func (r *SpscRingBuffer) AvailableWrite() uint64 {
 }
 
 func (r *SpscRingBuffer) Reset() {
-	atomic.StoreUint64(&r.writePos, 0)
-	atomic.StoreUint64(&r.readPos, 0)
+	w := atomic.LoadUint64(&r.writePos)
+	atomic.StoreUint64(&r.readPos, w)
 	r.resamplePos = 0
 }
 
@@ -108,18 +108,42 @@ func (r *SpscRingBuffer) WriteStereo(src []float32, frames uint64) uint64 {
 	return frames
 }
 
-// ReadStereoAdaptive performs click-free Fractional Resampling to keep latency locked
-// around targetLatencyFrames (~10ms) and applies per-sample exponential volume smoothing.
-func (r *SpscRingBuffer) ReadStereoAdaptive(dst []float32, outFrames uint64, targetDspGain float32, muted bool, targetLatencyFrames uint64) uint64 {
+// ReadStereoAdaptive performs click-free Fractional Resampling across mismatched sample rates
+// (e.g., 48kHz -> 44.1kHz or 16kHz Bluetooth) AND locks buffer fill to targetLatencyFrames.
+func (r *SpscRingBuffer) ReadStereoAdaptive(
+	dst []float32,
+	outFrames uint64,
+	targetDspGain float32,
+	muted bool,
+	srcSampleRate uint32,
+	dstSampleRate uint32,
+	targetLatencyFrames uint64,
+) uint64 {
 	avail := r.AvailableRead()
 	if avail < 4 || outFrames == 0 {
 		if outFrames > 0 {
 			atomic.AddUint64(&r.underrun, 1)
-			for i := uint64(0); i < outFrames*2; i++ {
-				dst[i] = 0
-			}
+			clear(dst[:outFrames*2])
 		}
 		return 0
+	}
+
+	if srcSampleRate == 0 {
+		srcSampleRate = 48000
+	}
+	if dstSampleRate == 0 {
+		dstSampleRate = 48000
+	}
+
+	// 1. True base sample rate conversion ratio (e.g., 48000 / 44100 = 1.088435)
+	baseRatio := float64(srcSampleRate) / float64(dstSampleRate)
+
+	// 2. Hard-snap if buffer bloated (e.g., Bluetooth A2DP startup stall > 45ms over target)
+	maxTolerableSlack := uint64(srcSampleRate) * 45 / 1000
+	if avail > targetLatencyFrames+maxTolerableSlack {
+		drop := avail - targetLatencyFrames
+		atomic.AddUint64(&r.readPos, drop)
+		avail = targetLatencyFrames
 	}
 
 	goalGain := targetDspGain
@@ -127,18 +151,23 @@ func (r *SpscRingBuffer) ReadStereoAdaptive(dst []float32, outFrames uint64, tar
 		goalGain = 0.0
 	}
 
-	// Proportional drift controller: adjusts playback pitch by up to ±0.5% to lock buffer to target
+	// 3. Proportional drift controller around the true base sample rate ratio
 	driftError := float64(int64(avail) - int64(targetLatencyFrames))
-	stepRatio := 1.0 + clampFloat64(driftError*0.000008, -0.005, 0.005)
+	driftAdjust := clampFloat64(driftError*0.00002, -0.025, 0.025)
+	stepRatio := baseRatio * (1.0 + driftAdjust)
 
 	maxNeeded := uint64(math.Ceil(float64(outFrames)*stepRatio)) + 2
 	if maxNeeded > avail {
+		// If we are intentionally building up delay for cross-device sync, output silence
+		// while letting the ring buffer accumulate up to targetLatencyFrames.
+		if avail < targetLatencyFrames/2 {
+			clear(dst[:outFrames*2])
+			return 0
+		}
 		stepRatio = float64(avail-2) / float64(outFrames)
-		if stepRatio < 0.95 {
+		if stepRatio < baseRatio*0.92 {
 			atomic.AddUint64(&r.underrun, 1)
-			for i := uint64(0); i < outFrames*2; i++ {
-				dst[i] = 0
-			}
+			clear(dst[:outFrames*2])
 			return 0
 		}
 	}
@@ -184,14 +213,11 @@ func splitHybridVolume(slider float32) (osScalar float32, dspBoost float32) {
 		return 0.0, 0.0
 	}
 	if slider <= 1.0 {
-		// 0% to 100%: Windows Native Volume handles 100% of the attenuation; DSP stays bit-perfect 1.0x!
 		return slider, 1.0
 	}
-	// 100% to 150%: Lock Windows Native Volume at 100% (1.0) and apply up to +6dB (2.0x) digital boost
 	return 1.0, 1.0 + (slider-1.0)*2.0
 }
 
-// effectiveTotalGain computes the combined perceptual gain for dB display in the UI
 func effectiveTotalGain(slider float32) float32 {
 	if slider <= 0.001 {
 		return 0.0
@@ -351,7 +377,7 @@ func encodeFromStereoFloat(srcStereo []float32, rawPtr *byte, frames int, channe
 }
 
 // ============================================================================
-// 3. LOW-LATENCY WASAPI ENGINE + NATIVE WINDOWS VOLUME SYNC (IAudioEndpointVolume)
+// 3. LOW-LATENCY WASAPI ENGINE + CROSS-DEVICE LATENCY SYNC + OS VOLUME SYNC
 // ============================================================================
 
 func boostProAudioThread() func() {
@@ -391,14 +417,15 @@ type TargetState struct {
 	ActiveFlag  uint32 // atomic (0 or 1)
 	MutedFlag   uint32 // atomic (0 or 1)
 	VolumeBits  uint32 // atomic float32 slider [0.0 .. 1.5]
-	LastUserSet int64  // atomic unix nano timestamp (prevents OS poll bounce during rapid key presses)
+	LastUserSet int64  // atomic unix nano timestamp
 	Ring        *SpscRingBuffer
 	StopChan    chan struct{}
 
-	SampleRate uint32 // atomic
-	Channels   uint32 // atomic
-	Bits       uint32 // atomic
-	BufferUs   uint32 // atomic (microseconds)
+	SampleRate    uint32 // atomic
+	Channels      uint32 // atomic
+	Bits          uint32 // atomic
+	BufferUs      uint32 // atomic (microseconds)
+	ExtraOffsetMs int32  // atomic manual delay offset in ms (for compensating BT air-gap lag)
 }
 
 func (t *TargetState) IsActive() bool { return atomic.LoadUint32(&t.ActiveFlag) == 1 }
@@ -451,6 +478,8 @@ type AudioEngine struct {
 	MasterMute    uint32
 	MasterVolBits uint32
 	TargetFloorMs uint32 // atomic target latency floor in ms (default 10ms)
+	SrcSampleRate uint32 // atomic capture sample rate (default 48000Hz)
+	AutoSyncMode  uint32 // atomic (1 = lock all outputs to slowest active endpoint's ms latency)
 
 	volCmdChan chan endpointVolCmd
 
@@ -463,11 +492,58 @@ func NewAudioEngine() *AudioEngine {
 		Targets:       make(map[string]*TargetState),
 		SourceIndex:   0,
 		TargetFloorMs: 10,
+		SrcSampleRate: 48000,
+		AutoSyncMode:  1, // Enabled by default so all active outputs match ms latency
 		volCmdChan:    make(chan endpointVolCmd, 64),
 	}
 	eng.SetMasterVolumeInternal(1.0)
 	go eng.osVolumeSyncWorker()
 	return eng
+}
+
+// ComputeTargetRingFrames calculates how many source frames a target's ring buffer
+// should hold so that its total latency (RingMs + HwMs*0.5) matches the slowest
+// active device when AutoSyncMode is enabled, plus any manual per-device offset.
+func (e *AudioEngine) ComputeTargetRingFrames(target *TargetState, srcRate uint32) uint64 {
+	if srcRate == 0 {
+		srcRate = 48000
+	}
+	floorMs := float64(atomic.LoadUint32(&e.TargetFloorMs))
+	myHwMs := float64(atomic.LoadUint32(&target.BufferUs)) / 1000.0 * 0.5
+	myExtraMs := float64(atomic.LoadInt32(&target.ExtraOffsetMs))
+
+	desiredRingMs := floorMs + myExtraMs
+
+	if atomic.LoadUint32(&e.AutoSyncMode) == 1 {
+		var maxTotalMs float64
+		e.mu.RLock()
+		for _, t := range e.Targets {
+			if t.IsActive() {
+				tHwMs := float64(atomic.LoadUint32(&t.BufferUs)) / 1000.0 * 0.5
+				tExtraMs := float64(atomic.LoadInt32(&t.ExtraOffsetMs))
+				tMinTotal := floorMs + tHwMs + tExtraMs
+				if tMinTotal > maxTotalMs {
+					maxTotalMs = tMinTotal
+				}
+			}
+		}
+		e.mu.RUnlock()
+
+		// Delay faster devices so their (RingMs + myHwMs) equals maxTotalMs
+		syncedRingMs := maxTotalMs - myHwMs
+		if syncedRingMs > desiredRingMs {
+			desiredRingMs = syncedRingMs
+		}
+	}
+
+	if desiredRingMs < 4.0 {
+		desiredRingMs = 4.0
+	}
+	if desiredRingMs > 1500.0 {
+		desiredRingMs = 1500.0
+	}
+
+	return uint64(float64(srcRate) * desiredRingMs / 1000.0)
 }
 
 func (e *AudioEngine) SetMasterVolumeInternal(v float32) {
@@ -479,7 +555,6 @@ func (e *AudioEngine) SetMasterVolumeInternal(v float32) {
 	atomic.StoreUint32(&e.MasterVolBits, math.Float32bits(v))
 }
 
-// SetMasterVolume updates the source endpoint's Windows Native Volume + DSP Boost
 func (e *AudioEngine) SetMasterVolume(v float32) {
 	if v < 0 {
 		v = 0
@@ -513,7 +588,6 @@ func (e *AudioEngine) GetMasterVolume() float32 {
 	return math.Float32frombits(atomic.LoadUint32(&e.MasterVolBits))
 }
 
-// ToggleMasterMute toggles both the internal master mute and the source device's Windows Native Mute
 func (e *AudioEngine) ToggleMasterMute() bool {
 	var isMuted bool
 	for {
@@ -554,7 +628,6 @@ func (e *AudioEngine) IsMasterMuted() bool {
 	return atomic.LoadUint32(&e.MasterMute) == 1
 }
 
-// SetDeviceVolume adjusts a specific endpoint's volume AND immediately overrides Windows Native Volume
 func (e *AudioEngine) SetDeviceVolume(deviceID string, newVol float32) {
 	if newVol < 0.0 {
 		newVol = 0.0
@@ -579,7 +652,6 @@ func (e *AudioEngine) SetDeviceVolume(deviceID string, newVol float32) {
 	e.queueOSVolumeUpdate(deviceID, true, osScalar, false, false)
 }
 
-// ToggleDeviceMute toggles a specific endpoint's mute state AND overrides Windows Native Mute
 func (e *AudioEngine) ToggleDeviceMute(deviceID string) bool {
 	e.mu.RLock()
 	t := e.Targets[deviceID]
@@ -626,9 +698,6 @@ func (e *AudioEngine) queueOSVolumeUpdate(deviceID string, setVol bool, volScala
 	}
 }
 
-// osVolumeSyncWorker runs a dedicated COM thread that:
-// 1. Applies volume/mute changes directly to Windows native IAudioEndpointVolume
-// 2. Polls Windows native volume every 150ms so hardware media keys / taskbar changes sync back into the TUI!
 func (e *AudioEngine) osVolumeSyncWorker() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -706,7 +775,6 @@ func (e *AudioEngine) pollAllEndpointsFromOS(mmde *wca.IMMDeviceEnumerator) {
 			continue
 		}
 
-		// Grace period of 450ms after user presses volume keys in TUI so OS polling doesn't fight user input
 		if now-atomic.LoadInt64(&t.LastUserSet) < int64(450*time.Millisecond) {
 			continue
 		}
@@ -722,7 +790,6 @@ func (e *AudioEngine) pollAllEndpointsFromOS(mmde *wca.IMMDeviceEnumerator) {
 			var osMute bool
 			if err1 := aev.GetMasterVolumeLevelScalar(&osVol); err1 == nil {
 				curSlider := t.GetVolume()
-				// If slider is in >100% boost range and Windows is still near 100%, preserve the user's boost
 				if !(curSlider > 1.0 && osVol >= 0.98) {
 					t.SetVolume(osVol)
 					if idx == srcIdx {
@@ -816,7 +883,6 @@ func (e *AudioEngine) RefreshDevices() error {
 				ps.Release()
 			}
 
-			// Read initial Windows Native Volume & Mute state for every endpoint
 			osVol := float32(1.0)
 			osMute := false
 			var aev *wca.IAudioEndpointVolume
@@ -965,6 +1031,8 @@ func (e *AudioEngine) captureLoopbackThread(deviceID string, stopCh chan struct{
 	blockAlign := int(wfx.NBlockAlign)
 	bitsPerSample := int(wfx.WBitsPerSample)
 
+	atomic.StoreUint32(&e.SrcSampleRate, sampleRate)
+
 	var defaultPeriod, minPeriod wca.REFERENCE_TIME
 	_ = ac.GetDevicePeriod(&defaultPeriod, &minPeriod)
 	if minPeriod == 0 {
@@ -1044,8 +1112,6 @@ func (e *AudioEngine) captureLoopbackThread(deviceID string, stopCh chan struct{
 					frames = maxScratchFrames
 				}
 
-				// Note: Windows Loopback taps BEFORE the endpoint hardware volume, OR after depending on driver.
-				// Using splitHybridVolume ensures 0..100% controls the physical Windows speaker while >100% boosts DSP!
 				_, masterDspBoost := splitHybridVolume(e.GetMasterVolume())
 				if e.IsMasterMuted() {
 					masterDspBoost = 0.0
@@ -1158,7 +1224,6 @@ func (e *AudioEngine) renderTargetThread(target *TargetState, stopCh chan struct
 		atomic.StoreUint32(&target.BufferUs, bufUs)
 	}
 
-	// Ensure Windows native endpoint volume matches the target slider on stream start
 	osScalar, _ := splitHybridVolume(target.GetVolume())
 	e.queueOSVolumeUpdate(target.Device.ID, true, osScalar, true, target.IsMuted())
 
@@ -1166,6 +1231,9 @@ func (e *AudioEngine) renderTargetThread(target *TargetState, stopCh chan struct
 		return
 	}
 	defer ac.Stop()
+
+	// CRITICAL FOR BLUETOOTH: Flush any backlog accumulated during slow A2DP transport startup!
+	target.Ring.Reset()
 
 	const maxScratchFrames = 16384
 	readScratch := make([]float32, maxScratchFrames*2)
@@ -1205,14 +1273,20 @@ func (e *AudioEngine) renderTargetThread(target *TargetState, stopCh chan struct
 			frames = maxScratchFrames
 		}
 
-		// 0%..100% is handled natively by the target device's Windows OS Hardware Volume!
-		// dspBoost is 1.0x for [0..100%], and scales up to 2.0x (+6dB) when slider is [100%..150%].
 		_, dspBoost := splitHybridVolume(target.GetVolume())
 		muted := target.IsMuted()
-		floorMs := atomic.LoadUint32(&e.TargetFloorMs)
-		targetLatencyFrames := uint64(sampleRate) * uint64(floorMs) / 1000
+		srcRate := atomic.LoadUint32(&e.SrcSampleRate)
+		targetLatencyFrames := e.ComputeTargetRingFrames(target, srcRate)
 
-		got := target.Ring.ReadStereoAdaptive(readScratch[:frames*2], uint64(frames), dspBoost, muted, targetLatencyFrames)
+		got := target.Ring.ReadStereoAdaptive(
+			readScratch[:frames*2],
+			uint64(frames),
+			dspBoost,
+			muted,
+			srcRate,
+			sampleRate,
+			targetLatencyFrames,
+		)
 		if got == 0 || outData == nil {
 			_ = arc.ReleaseBuffer(framesAvail, wca.AUDCLNT_BUFFERFLAGS_SILENT)
 		} else {
@@ -1429,7 +1503,7 @@ func initialModel(eng *AudioEngine) model {
 	eng.RestartSourceCapture(eng.SourceIndex)
 	return model{
 		engine:    eng,
-		statusMsg: "2-Way Windows OS Volume Sync Active (0-100% Native HW + 100-150% DSP Boost)",
+		statusMsg: "Auto Latency Sync Active • Use [,] / [.] on wired outputs to match Bluetooth wireless delay",
 	}
 }
 
@@ -1543,6 +1617,48 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusMsg = fmt.Sprintf("Target Ring Buffer Floor relaxed to %d ms", cur+2)
 			}
 
+		case "a":
+			cur := atomic.LoadUint32(&m.engine.AutoSyncMode)
+			next := cur ^ 1
+			atomic.StoreUint32(&m.engine.AutoSyncMode, next)
+			if next == 1 {
+				m.statusMsg = "AUTO LATENCY SYNC: ON (All outputs locked to slowest active endpoint)"
+			} else {
+				m.statusMsg = "AUTO LATENCY SYNC: OFF (Independent minimum latency per endpoint)"
+			}
+
+		case ",":
+			if devCount > 0 {
+				m.engine.mu.RLock()
+				dev := m.engine.Devices[m.cursor]
+				t := m.engine.Targets[dev.ID]
+				m.engine.mu.RUnlock()
+				if t != nil {
+					newOff := atomic.AddInt32(&t.ExtraOffsetMs, -5)
+					if newOff < 0 {
+						atomic.StoreInt32(&t.ExtraOffsetMs, 0)
+						newOff = 0
+					}
+					m.statusMsg = fmt.Sprintf("[%s] Manual Sync Delay Offset: +%dms", truncateString(dev.Name, 24), newOff)
+				}
+			}
+
+		case ".":
+			if devCount > 0 {
+				m.engine.mu.RLock()
+				dev := m.engine.Devices[m.cursor]
+				t := m.engine.Targets[dev.ID]
+				m.engine.mu.RUnlock()
+				if t != nil {
+					newOff := atomic.AddInt32(&t.ExtraOffsetMs, 5)
+					if newOff > 1000 {
+						atomic.StoreInt32(&t.ExtraOffsetMs, 1000)
+						newOff = 1000
+					}
+					m.statusMsg = fmt.Sprintf("[%s] Manual Sync Delay Offset: +%dms", truncateString(dev.Name, 24), newOff)
+				}
+			}
+
 		case "r":
 			_ = m.engine.RefreshDevices()
 			m.statusMsg = "Re-enumerated & Synced Active Windows WASAPI Endpoints"
@@ -1587,17 +1703,25 @@ func (m model) View() string {
 	masterVol := m.engine.GetMasterVolume()
 	masterMuted := m.engine.IsMasterMuted()
 	floorMs := atomic.LoadUint32(&m.engine.TargetFloorMs)
+	autoSync := atomic.LoadUint32(&m.engine.AutoSyncMode) == 1
+	srcSr := atomic.LoadUint32(&m.engine.SrcSampleRate)
+	if srcSr == 0 {
+		srcSr = 48000
+	}
+
+	syncBadge := pillSubtle.Render(fmt.Sprintf("FLOOR: %dms", floorMs))
+	if autoSync {
+		syncBadge = pillProAudio.Render(fmt.Sprintf("SYNC LOCK • %dms", floorMs))
+	}
 
 	masterDb := gainToDbString(effectiveTotalGain(masterVol), masterMuted)
 	topHeader := lipgloss.JoinHorizontal(
 		lipgloss.Center,
 		headerBrandStyle.Render("⚡ WASAPI RT-MATRIX"),
 		" ",
-		pillProAudio.Render("OS VOL SYNC"),
+		syncBadge,
 		" ",
 		pillSubtle.Render(fmt.Sprintf("SRC %dHz/%dbit • %.1fms", tel.SampleRate, tel.Bits, tel.PeriodMs)),
-		" ",
-		pillSubtle.Render(fmt.Sprintf("DRIFT TARGET: %dms", floorMs)),
 		" ",
 		func() string {
 			if masterMuted {
@@ -1687,14 +1811,11 @@ func (m model) View() string {
 		if i == srcIdx {
 			latStr = cyanText.Render(fmt.Sprintf("%5.1fms ", tel.PeriodMs))
 		} else if t != nil && t.IsActive() {
-			sr := atomic.LoadUint32(&t.SampleRate)
-			if sr == 0 {
-				sr = 48000
-			}
-			ringMs := float64(t.Ring.AvailableRead()) * 1000.0 / float64(sr)
+			// Ring buffer stores frames at SrcSampleRate
+			ringMs := float64(t.Ring.AvailableRead()) * 1000.0 / float64(srcSr)
 			hwMs := float64(atomic.LoadUint32(&t.BufferUs)) / 1000.0
 			totalMs := ringMs + hwMs*0.5
-			if totalMs < 15.0 {
+			if totalMs < 25.0 {
 				latStr = greenText.Render(fmt.Sprintf("%5.1fms ", totalMs))
 			} else {
 				latStr = amberText.Render(fmt.Sprintf("%5.1fms ", totalMs))
@@ -1725,12 +1846,10 @@ func (m model) View() string {
 		sr := atomic.LoadUint32(&selectedTarget.SampleRate)
 		bits := atomic.LoadUint32(&selectedTarget.Bits)
 		hwMs := float64(atomic.LoadUint32(&selectedTarget.BufferUs)) / 1000.0
+		extraOff := atomic.LoadInt32(&selectedTarget.ExtraOffsetMs)
 		ur := atomic.LoadUint64(&selectedTarget.Ring.underrun)
 		or := atomic.LoadUint64(&selectedTarget.Ring.overrun)
-		ringMs := 0.0
-		if sr > 0 {
-			ringMs = float64(selectedTarget.Ring.AvailableRead()) * 1000.0 / float64(sr)
-		}
+		ringMs := float64(selectedTarget.Ring.AvailableRead()) * 1000.0 / float64(srcSr)
 		if ringMs > 999.9 {
 			ringMs = 999.9
 		}
@@ -1748,29 +1867,28 @@ func (m model) View() string {
 		leftLines = append(leftLines, cyanText.Render("INSPECT: ")+mutedText.Render(inspTitle))
 
 		if selectedTarget.IsActive() {
-			// Line 1 (Fixed columns): WIN-OS (4) | DSP + dB (17) | FMT (12) -> ~48 chars total (never wraps)
 			line1 := fmt.Sprintf(
 				"%s %3.0f%%  %s %4.2fx (%s)  %s %5dHz/%2dbit",
 				dimText.Render("WIN-OS:"), osScalar*100,
 				dimText.Render("DSP:"), dspBoost, amberText.Render(dbStr),
 				dimText.Render("FMT:"), sr, bits,
 			)
-			// Line 2 (Fixed columns): RING (7 chars: "%5.1fms") | DAC (7 chars: "%5.1fms") | U/O (9 chars: "%4d/%-4d")
 			line2 := fmt.Sprintf(
-				"%s %5.1fms   %s %5.1fms   %s %4d/%-4d",
+				"%s %5.1fms  %s %4.1fms  %s +%dms  %s %d/%d",
 				dimText.Render("RING:"), ringMs,
 				dimText.Render("DAC:"), hwMs,
+				dimText.Render("OFFSET:"), extraOff,
 				dimText.Render("U/O:"), ur, or,
 			)
 			leftLines = append(leftLines, line1, line2)
 		} else {
 			line1 := fmt.Sprintf(
-				"%s %3.0f%%  %s %4.2fx (%s)  %s STANDBY",
+				"%s %3.0f%%  %s %4.2fx (%s)  %s +%dms",
 				dimText.Render("WIN-OS:"), osScalar*100,
 				dimText.Render("DSP:"), dspBoost, amberText.Render(dbStr),
-				dimText.Render("STATE:"),
+				dimText.Render("OFFSET:"), extraOff,
 			)
-			line2 := dimText.Render("Press [Space] to enable render stream • [←/→] Adjust OS Vol")
+			line2 := dimText.Render("[Space] Enable Out • [,/ .] Delay Offset • [a] Auto-Sync")
 			leftLines = append(leftLines, line1, line2)
 		}
 	}
@@ -1806,7 +1924,7 @@ func (m model) View() string {
 
 	statusBar := greenText.Render("● ") + mutedText.Render(m.statusMsg)
 	helpBar := dimText.Render(
-		"[↑/↓] Nav  [Space] Toggle Out  [Enter/s] Set Src  [←/→] OS Vol+Boost  [m] OS Mute  [[/]] Src Vol  [-/+] Latency  [q] Quit",
+		"[↑/↓] Nav  [Space] Out  [Enter] Src  [←/→] Vol  [,/.] +Delay  [a] Auto-Sync  [-/+] Floor  [q] Quit",
 	)
 
 	return lipgloss.JoinVertical(
@@ -1823,7 +1941,7 @@ func gainToDbString(linearGain float32, muted bool) string {
 		return "  -∞ dB "
 	}
 	db := 20.0 * math.Log10(float64(linearGain))
-	return fmt.Sprintf("%+6.1fdB", db) // Always 8 chars (e.g., " -19.9dB" or "  +0.0dB")
+	return fmt.Sprintf("%+6.1fdB", db)
 }
 
 func renderCompactGain(slider float32, muted bool, width int) string {
