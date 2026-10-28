@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software or its architectural concepts in your research, please cite it using these metadata."
+type: software
+title: "wasapi-router-go: Ultra-Low-Latency Windows Core Audio Loopback Mirroring Engine, Hermite Cubic ASRC, and Real-Time DSP Telemetry in Go"
+abstract: "A zero-CGo, heap-safe Windows Audio Session API (WASAPI) real-time loopback routing matrix and DSP telemetry suite in Go featuring MMCSS Pro Audio kernel scheduling, lock-free SPSC ring buffers, 4-point Hermite cubic asynchronous sample rate conversion, automatic cross-device latency synchronization, and 16-band Hann-Goertzel spectral analysis."
+authors:
+  - alias: "masfana"
+    name: "Masfana"
+repository-code: "https://github.com/masfana/wasapi-router-go"
+url: "https://github.com/masfana/wasapi-router-go"
+license: MIT
+keywords:
+  - wasapi
+  - golang
+  - real-time-audio
+  - digital-signal-processing
+  - sample-rate-conversion
+  - lock-free
+  - ring-buffer
+  - mmcss
+  - goertzel-algorithm
+  - audio-router
+version: "2.0.0"
+date-released: "2026-10-29"
